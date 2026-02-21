@@ -1,122 +1,151 @@
-# Strix CLI
+# 🦉 Strix CLI & API
 
-Strix is a Python command‑line tool that scans a GitHub repository, generates necessary configuration files using AI, and spins up a development environment with Docker Compose.
-
-## Development Overview
-
-This repository is currently in active development. The goal is to provide a **developer-friendly CLI** named `strix` that can inspect a GitHub repository, infer its technology stack, and automatically generate the necessary containerization and environment files via an AI backend.
-
-You’ll find the work split across two main packages (`cli` and `backend`) plus some static templates. Below is the workflow and component responsibilities, designed to help your team understand what to build and how the pieces fit together.
+**Strix** is an intelligent, AI-powered tool that instantly transforms any GitHub repository into a ready-to-code development environment. By analyzing a repository's source code, Strix automatically infers its technology stack and uses AI to generate production-ready Docker configurations, spinning them up seamlessly.
 
 ---
 
-### Workflow (high level)
+## 🎯 Our Goal
 
-1. **User invokes CLI** with a GitHub URL (`strix <url>`).
-2. CLI clones the repo locally (implementation in `analyzer`).
-3. Analyzer inspects files (`requirements.txt`, `Dockerfile`, `package.json`, etc.) and builds a profile containing languages, frameworks, ports, databases, etc.
-4. The profile is sent to an AI service (OpenAI or Claude) in `generator.generate`.
-5. AI returns a set of text artifacts: a `Dockerfile`, `docker-compose.dev.yml`, `.env.example`, and a `PROJECT.md` detailing the project.
-6. CLI writes these files into the target repository, then uses `subprocess` to run `docker compose` and spin up the environment.
-7. The `doctor` command calls `health.check_all` to ping the running API and any database connections, reporting status using Rich output.
+The primary goal of Strix is to **eliminate the "it works on my machine" problem** and remove the tedious boilerplate of setting up local development environments. 
 
-> **Note:** AI integration is stubbed at the moment; replace the placeholder with actual API calls and prompt engineering logic.
+Whether you are onboarding a new developer, reviewing a pull request, or exploring an open-source project, Strix bridges the gap between raw code and a running application by automating containerization and environment configuration.
 
 ---
 
-### Package breakdown
+## ✨ Key Features
 
-#### `strix/cli`
-
-- **`main.py`** – entrypoint for the Typer CLI.
-  - `scan` command orchestrates analysis, generation, writing of files, and starting Docker.
-  - `doctor` command invokes health checks and prints colored results.
-  - Uses [Rich](https://github.com/Textualize/rich) for spinners and stylistic output.
-
-#### `strix/backend`
-
-- **`analyzer.py`** – responsible for cloning the repo (e.g. via `git`), reading key files, and constructing a dictionary representing the project. Add parsers for languages, frameworks, DB URLs, exposed ports, etc.
-- **`generator.py`** – encapsulates AI logic. Currently returns hardcoded strings. Later integrate with `openai` or Claude API:
-  ```python
-  from openai import OpenAI
-  client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-  response = client.responses.create(...)
-  ```
-  The AI prompt should include the profile and ask for formatted files.
-- **`health.py`** – lightweight checks using `requests` for HTTP and stubbed DB connectivity. Expand to support specific drivers.
-- **`main.py`** – simple FastAPI app used for internal health endpoints or extensions.
-
-#### `tesis/templates`
-
-Stores static examples that serve as starting seeds for generated content. They are **not** used at runtime but can be referenced by generator logic or tests.
-
-- `devcontainer.json` – example for VS Code dev containers; useful when preparing the CLI repo itself.
-- `docker-compose.yml` – baseline compose file showing service structure; used for documentation or AI examples.
-
-> Generated output files will live in the target repository and are named:
-> - `Dockerfile`
-> - `docker-compose.dev.yml`
-> - `.env.example`
-> - `PROJECT.md`
+- **🧠 AI-Powered Generation**: Uses Groq (`llama-3.3-70b-versatile`) to intelligently generate `Dockerfile`, `docker-compose.dev.yml`, `.env.example`, and `PROJECT.md`.
+- **🔍 Smart Repository Analysis**: Automatically clones and scans repositories to detect languages, frameworks (React, Vite, FastAPI, etc.), and exposed ports.
+- **🐳 Auto-Deployment**: Automatically runs `docker compose up --build -d` and reports the exposed host ports.
+- **💻 Dual Interface**: 
+  - A beautiful, rich **CLI** for terminal power users.
+  - A **FastAPI backend** with CORS enabled, designed to serve a React frontend.
 
 ---
 
-### Project structure (for quick reference)
-```
-strix/
+## 🏗️ Architecture & Codebase Overview
+
+The codebase is structured into two main packages: the CLI and the Backend API.
+
+```text
+StrixReady-CLI/
 ├── cli/
-│   ├── __init__.py
-│   └── main.py          # Typer commands & Rich output
+│   └── main.py          # Typer CLI entrypoint (commands: scan, gui, doctor)
 ├── backend/
-│   ├── __init__.py
-│   ├── main.py          # FastAPI app (health endpoints)
-│   ├── analyzer.py      # inspect & profile target repo
-│   ├── generator.py     # AI prompt/response handling + file writer
-│   └── health.py        # ping API/DB for "doctor" command
-├── templates/           # static examples and devcontainer
-│   ├── devcontainer.json
-│   └── docker-compose.yml
-├── pyproject.toml       # packaging metadata
-├── requirements.txt     # development dependencies
-└── README.md            # developer-centric documentation
+│   ├── analyzer.py      # Git cloning & local file scanning (detects stack/ports)
+│   ├── generator.py     # Groq AI integration, artifact parsing, and Docker execution
+│   ├── health.py        # System and service health checks
+│   ├── main.py          # FastAPI application (endpoints: /scan, /health)
+│   └── utils.py         # Shared utilities (e.g., CLI color constants)
+├── prompts/             # System prompts for the AI model
+├── pyproject.toml       # Project metadata and dependencies
+└── .env                 # Environment variables (e.g., GROQ_API_KEY)
 ```
 
----
-
-### AI Integration
-
-- **Where?** In `backend/generator.py`.
-- **What?** Your AI model should take a JSON-like profile produced by `analyzer.analyze_repo()` and return strings for the four output files.
-- **How to test:** stub the `generate` function to return predictable content, then verify `write_artifacts` writes correctly and the CLI is able to start Docker.
-- **Future enhancements:** Add caching, prompt templates, and support for multiple AI providers.
+### How it Works (The Pipeline)
+1. **Input**: The user provides a GitHub URL and a target OS (via CLI or API).
+2. **Clone & Analyze** (`analyzer.py`): Strix performs a shallow clone of the repo to a temporary directory and scans the files to build a "Profile" (languages, frameworks, configs).
+3. **Generate** (`generator.py`): The profile is sent to Groq AI. The AI returns structured JSON containing the necessary Docker and environment files.
+4. **Write & Run** (`generator.py`): Strix writes the generated artifacts into the cloned repository and executes `docker compose up --build -d`.
+5. **Output**: The exposed ports and running status are returned to the user or frontend.
 
 ---
 
-### Running & iterating locally
+## 🚀 Getting Started
 
+### Prerequisites
+- **Python 3.13+**
+- **Docker & Docker Compose**
+- **Git**
+- **Groq API Key**
+
+### Installation
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/yourusername/StrixReady-CLI.git
+   cd StrixReady-CLI
+   ```
+
+2. **Set up the virtual environment:**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install dependencies:**
+   ```bash
+   pip install -e .
+   ```
+
+4. **Configure Environment Variables:**
+   Create a `.env` file in the root directory:
+   ```env
+   GROQ_API_KEY=your_groq_api_key_here
+   ```
+
+---
+
+## 💻 Usage
+
+### 1. Using the CLI
+
+Scan a repository and spin it up:
 ```bash
-# from workspace root
-python -m venv .venv
-source .venv/bin/activate
-pip install -e strix  # editable install makes CLI available as `strix`
+strix scan https://github.com/sanjayrohith/ResQ-Desk --os linux
 ```
 
-To invoke the backend FastAPI app directly (useful for debugging health checks):
+Start the API server:
 ```bash
-uvicorn strix.backend.main:app --reload
+strix gui --port 8000
 ```
 
-Unit tests aren’t included yet—plan for `pytest` with fixtures that mock `subprocess`, `requests`, and AI responses.
+Check system health:
+```bash
+strix doctor
+```
+
+### 2. Using the API
+
+Start the FastAPI server:
+```bash
+uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Endpoint:** `POST /scan`
+```json
+// Request
+{
+  "url": "https://github.com/sanjayrohith/ResQ-Desk",
+  "os": "linux"
+}
+
+// Response
+{
+  "profile": { ... },
+  "artifacts": {
+    "Dockerfile": "...",
+    "docker-compose.dev.yml": "...",
+    ".env.example": "...",
+    "PROJECT.md": "..."
+  },
+  "compose": {
+    "running": true,
+    "ports": [5173],
+    "error": null
+  }
+}
+```
 
 ---
 
-### Tips for new contributors
+## 🛠️ Future Improvements & Roadmap
 
-- Start by fleshing out `analyzer` logic; it’s the foundation of the flow.
-- Keep the CLI dumb; let the backend modules encapsulate business logic.
-- Add type hints and run `mypy`/`flake8` frequently.
-- Document any new environment variables (e.g. `OPENAI_API_KEY`) in `.env.example` once generated.
+While Strix is fully functional, there are several areas for enhancement:
 
----
-
-More walkthroughs, diagrams, and onboarding notes can be added as the tool matures. This README should serve as the single source of truth for developers stepping into the project.
+1. **Testing Suite**: Implement comprehensive unit and integration tests using `pytest`, including mocks for the Groq API and Docker subprocesses.
+2. **Cleanup Mechanism**: Add a routine to clean up temporary cloned directories (`/tmp/strix_*`) after a session ends or a container is spun down.
+3. **Multi-LLM Support**: Abstract the AI generation layer to support OpenAI, Anthropic, or local models (like Ollama) as fallbacks to Groq.
+4. **Advanced Health Checks**: Upgrade `health.py` to actively monitor the health status of the spun-up Docker containers, rather than just the Strix API.
+5. **Monorepo Support**: Enhance the `analyzer.py` to detect and handle monorepos, generating multi-service compose files accordingly.
+6. **WebSocket Streaming**: Stream the AI generation and Docker build logs back to the React frontend in real-time via WebSockets.
