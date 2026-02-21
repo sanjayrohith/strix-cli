@@ -1,293 +1,258 @@
-import sys
 import os
-from typing import Dict, Any, Optional
-
-# make sure the project root is on sys.path so `import utils` succeeds
-# when running with `python -m backend.analyzer`
-from pathlib import Path
-project_root = Path(__file__).parent.parent.resolve()
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-import requests
-import base64
+import subprocess
 import json
+import tempfile
+from pathlib import Path
+from typing import Dict, Any, Optional, List
 
-from utils import colors
-from groq import Groq
-
-# --- 1. Load the System Prompt ---
-try:
-    with open("prompts/analyze_repo_prompt.txt", "r") as f:
-        SYSTEM_PROMPT = f.read()
-except FileNotFoundError:
-    print(f"{colors.RED}Error: 'prompts/analyze_repo_prompt.txt' not found.{colors.END}")
-    sys.exit(1)
-
-# --- 2. Configuration ---
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # Securely get token from environment
-HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+from backend.utils import colors
 
 
-# --- Helper Functions ---
+# --- Configuration ---
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+
 
 def parse_repo_url(repo_url: str) -> Optional[str]:
-    """Extracts 'owner/repo' from 'https://github.com/owner/repo'."""
+    """Extracts 'owner/repo' from a GitHub URL.
+
+    Also handles malformed double-prefix URLs such as
+    ``https://github.com/https://github.com/owner/repo``.
+    """
     try:
         if "github.com/" not in repo_url:
-            if len(repo_url.split('/')) == 2:
+            if len(repo_url.split("/")) == 2:
                 return repo_url
-            else:
-                raise ValueError("Invalid format")
+            raise ValueError("Invalid format")
 
-        parts = repo_url.split("github.com/")[1].split("/")
+        raw = repo_url
+        while raw.count("github.com/") > 1:
+            raw = raw.split("github.com/", 1)[1]
+
+        parts = raw.split("github.com/")[-1].split("/")
         owner = parts[0]
-        repo = parts[1].replace(".git", "")
+        repo = parts[1].replace(".git", "") if len(parts) > 1 else ""
+        if not owner or not repo:
+            return None
         return f"{owner}/{repo}"
     except Exception:
         return None
 
 
-def fetch_api_data(endpoint: str) -> Optional[dict]:
-    """Fetches data from a given GitHub API endpoint."""
-    url = f"https://api.github.com/repos/{endpoint}"
-    print(f"{colors.BLUE}Fetching: {url}{colors.END}")
-    try:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()  # Raises an error for 4xx or 5xx
-        return response.json()
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            print(f"{colors.RED}Error: Repository not found at {url}.{colors.END}")
-        elif e.response.status_code == 403:
-            print(f"{colors.RED}Error: GitHub API rate limit exceeded. {colors.END}")
-            print(f"{colors.YELLOW}Try setting a GITHUB_TOKEN to increase the limit.{colors.END}")
-        else:
-            print(f"{colors.RED}API Error: {e}{colors.END}")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"{colors.RED}Network Error: {e}{colors.END}")
-        return None
+def _build_clone_url(repo_url: str) -> str:
+    """Normalise any GitHub URL into an HTTPS clone URL."""
+    repo_path = parse_repo_url(repo_url)
+    if not repo_path:
+        raise ValueError(f"Cannot parse GitHub URL: {repo_url}")
+    return f"https://github.com/{repo_path}.git"
 
 
-def get_repo_data(repo_path: str):
-    """Fetches all repository data in one go."""
-    print(f"{colors.BLUE}--- Starting Analysis for {repo_path} ---{colors.END}")
+# ---------------------------------------------------------------------------
+# Clone
+# ---------------------------------------------------------------------------
 
-    repo_data = fetch_api_data(repo_path)
-    if not repo_data:
-        return None
+def clone_repo(repo_url: str, target_dir: Optional[str] = None) -> Path:
+    """Clone ``repo_url`` into ``target_dir`` (or a temp directory).
 
-    lang_data = fetch_api_data(f"{repo_path}/languages")
-    if not lang_data:
-        return None
+    Returns the absolute Path to the cloned repo on disk.
+    """
+    clone_url = _build_clone_url(repo_url)
+    repo_path = parse_repo_url(repo_url)
+    repo_name = repo_path.split("/")[-1] if repo_path else "repo"
 
-    readme_data = fetch_api_data(f"{repo_path}/readme")
-    if not readme_data or 'content' not in readme_data:
-        readme_content = "No README file found."
+    if target_dir:
+        dest = Path(target_dir) / repo_name
     else:
+        dest = Path(tempfile.mkdtemp(prefix="strix_")) / repo_name
+
+    if dest.exists():
+        print(f"{colors.YELLOW}Directory {dest} already exists – reusing.{colors.END}")
+        return dest.resolve()
+
+    print(f"{colors.BLUE}Cloning {clone_url} → {dest}{colors.END}")
+    env = os.environ.copy()
+    if GITHUB_TOKEN:
+        env["GIT_ASKPASS"] = "echo"
+        clone_url = clone_url.replace(
+            "https://", f"https://x-access-token:{GITHUB_TOKEN}@"
+        )
+
+    subprocess.run(
+        ["git", "clone", "--depth", "1", clone_url, str(dest)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    print(f"{colors.GREEN}Cloned successfully.{colors.END}")
+    return dest.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Local file scanning
+# ---------------------------------------------------------------------------
+
+_CONFIG_FILES = [
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "requirements.txt",
+    "pyproject.toml",
+    "Pipfile",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "Makefile",
+    "Gemfile",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    ".env",
+    ".env.example",
+]
+
+
+def _read_if_exists(repo_dir: Path, name: str) -> Optional[str]:
+    p = repo_dir / name
+    if p.is_file():
         try:
-            readme_content = base64.b64decode(readme_data['content']).decode('utf-8')
-        except Exception as e:
-            readme_content = f"Error decoding README: {e}"
+            return p.read_text(errors="replace")
+        except Exception:
+            return None
+    return None
 
-    return repo_data, lang_data, readme_content
+
+def _detect_languages(repo_dir: Path) -> Dict[str, int]:
+    """Walk the repo and count files by extension."""
+    ext_map = {
+        ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+        ".jsx": "JavaScript", ".tsx": "TypeScript",
+        ".java": "Java", ".go": "Go", ".rb": "Ruby",
+        ".rs": "Rust", ".php": "PHP", ".cs": "C#",
+        ".cpp": "C++", ".c": "C", ".swift": "Swift",
+        ".kt": "Kotlin", ".scala": "Scala",
+    }
+    counts: Dict[str, int] = {}
+    for f in repo_dir.rglob("*"):
+        if f.is_file() and ".git" not in f.parts:
+            lang = ext_map.get(f.suffix.lower())
+            if lang:
+                counts[lang] = counts.get(lang, 0) + 1
+    return counts
 
 
-# ---
-# THIS FUNCTION IS NOW FIXED
-# ---
-def build_user_prompt(repo_data: dict, lang_data: dict, readme_content: str) -> str:
-    """Builds the final prompt context for the LLM."""
-    print(f"{colors.BLUE}Building context for AI...{colors.END}")
+def _detect_frameworks(config_files: Dict[str, str]) -> tuple[List[str], List[int]]:
+    """Return (frameworks, ports) based on config file contents."""
+    frameworks: List[str] = []
+    ports: List[int] = []
 
-    MAX_README_LEN = 3000
-    if len(readme_content) > MAX_README_LEN:
-        readme_content = readme_content[:MAX_README_LEN] + "\n... (README truncated)"
+    pkg = config_files.get("package.json")
+    if pkg:
+        try:
+            pkg_json = json.loads(pkg)
+            deps = {
+                **pkg_json.get("dependencies", {}),
+                **pkg_json.get("devDependencies", {}),
+            }
+            if "next" in deps:
+                frameworks.append("Next.js"); ports.append(3000)
+            elif "react-scripts" in deps:
+                frameworks.append("Create React App"); ports.append(3000)
+            elif "nuxt" in deps:
+                frameworks.append("Nuxt"); ports.append(3000)
+            elif "vite" in deps:
+                frameworks.append("Vite"); ports.append(5173)
+            elif "express" in deps:
+                frameworks.append("Express"); ports.append(3000)
+            elif "vue" in deps:
+                frameworks.append("Vue"); ports.append(5173)
+            if "react" in deps and "Next.js" not in frameworks and "Create React App" not in frameworks:
+                frameworks.append("React")
+        except json.JSONDecodeError:
+            pass
 
-    license_info = repo_data.get('license') or {}
+    req_text = (config_files.get("requirements.txt") or "") + (
+        config_files.get("pyproject.toml") or ""
+    )
+    if req_text:
+        lower = req_text.lower()
+        if "django" in lower:
+            frameworks.append("Django"); ports.append(8000)
+        elif "flask" in lower:
+            frameworks.append("Flask"); ports.append(5000)
+        elif "fastapi" in lower:
+            frameworks.append("FastAPI"); ports.append(8000)
 
-    user_prompt = f"""
-    Repository Name: {repo_data.get('name') or 'N/A'}
-    Description: {repo_data.get('description') or 'N/A'}
-    Languages: {json.dumps(lang_data, indent=2)}
-    Stars: {repo_data.get('stargazers_count') or 'N/A'}
-    License: {license_info.get('name') or 'N/A'}
+    return frameworks, ports
 
-    --- README.md Content ---
-    {readme_content}
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def analyze_repo(repo_url: str, user_os: str = "linux") -> Dict[str, Any]:
+    """Clone a GitHub repository locally and return a structured profile.
+
+    Parameters
+    ----------
+    repo_url : str
+        Full GitHub URL (e.g. ``https://github.com/owner/repo``).
+    user_os : str
+        The operating system the user is running (``linux``, ``macos``, ``windows``).
+
+    Returns
+    -------
+    dict
+        A profile dict consumed by ``generator.generate()``.
     """
-    return user_prompt
-
-
-# --- Main tool function for the GitHub/AI analyser ---
-
-def run_github_analyzer(groq_client: Groq, repo_url: str):
-    """Analyzes a GitHub repository using the GitHub API and Groq.
-    This function now receives the initialized Groq client.
-    """
-
-    # 1. Parse the URL
-    repo_path = parse_repo_url(repo_url)
-    if not repo_path:
-        print(f"{colors.RED}Error: Invalid GitHub URL '{repo_url}'. Please use 'https://github.com/owner/repo'.{colors.END}")
-        return
-
-    # 2. Fetch all data from GitHub
-    data = get_repo_data(repo_path)
-    if not data:
-        return  # Error messages are handled inside get_repo_data
-
-    # 3. Build the prompt for the LLM
-    user_prompt = build_user_prompt(data[0], data[1], data[2])
-
-    # 4. Define the chat messages
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    # 5. Get the summary from Groq
-    print(f"{colors.BLUE}Generating summary via Groq... (This will be fast!){colors.END}")
-
-    print("\n" + "="*30)
-    print(f" {colors.GREEN}AI Analysis of {repo_path}{colors.END} ")
-    print("="*30 + "\n")
-
-    try:
-        completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b", # Using your preferred model
-            messages=messages,
-            temperature=0.2,
-            max_tokens=1024,
-            stream=True,
-            stop=None
+    repo_path_str = parse_repo_url(repo_url)
+    if not repo_path_str:
+        raise ValueError(
+            f"Invalid GitHub URL '{repo_url}'. "
+            "Use the format https://github.com/owner/repo"
         )
 
-        # This is the correct way to stream the output
-        for chunk in completion:
-            print(chunk.choices[0].delta.content or "", end="")
+    # 1. Clone
+    local_path = clone_repo(repo_url)
 
-        print("\n") # Add a newline after the stream is done
+    # 2. Read config files from disk
+    config_files: Dict[str, str] = {}
+    for fname in _CONFIG_FILES:
+        content = _read_if_exists(local_path, fname)
+        if content:
+            config_files[fname] = content
 
-    except Exception as e:
-        print(f"{colors.RED}\nAn error occurred during Groq API call: {e}{colors.END}")
+    # 3. Read README
+    readme = ""
+    for rname in ["README.md", "readme.md", "README.rst", "README"]:
+        content = _read_if_exists(local_path, rname)
+        if content:
+            readme = content
+            break
 
+    # 4. Detect languages & frameworks
+    languages = _detect_languages(local_path)
+    frameworks, ports = _detect_frameworks(config_files)
 
-# ------------------
-# Standalone runner
-# ------------------
+    repo_name = repo_path_str.split("/")[-1]
 
-if __name__ == "__main__":
-    import argparse
+    profile: Dict[str, Any] = {
+        "url": repo_url,
+        "repo_path": repo_path_str,
+        "name": repo_name,
+        "local_path": str(local_path),
+        "os": user_os,
+        "languages": languages,
+        "frameworks": frameworks,
+        "ports": ports,
+        "config_files": config_files,
+        "readme": readme,
+    }
 
-    parser = argparse.ArgumentParser(description="Run GitHub analyzer standalone.")
-    parser.add_argument("repo", help="GitHub repository URL or owner/repo")
-    args = parser.parse_args()
-
-    # simple dummy Groq client that echoes the messages
-    class DummyCompletions:
-        @staticmethod
-        def create(*args, **kwargs):
-            print("\n[Dummy AI invoke] messages passed to model:\n")
-            for m in kwargs.get("messages", []):
-                print(f"- {m['role']}: {m['content'][:200]}")
-            return []
-
-    class DummyChat:
-        completions = DummyCompletions
-
-    class DummyGroq:
-        chat = DummyChat
-
-    # invoke analyzer with dummy client
-    run_github_analyzer(DummyGroq(), args.repo)
-
-# ---
-# THIS FUNCTION IS NOW FIXED
-# ---
-def build_user_prompt(repo_data, lang_data, readme_content):
-    """Builds the final prompt context for the LLM."""
-    print(f"{colors.BLUE}Building context for AI...{colors.END}")
-    
-    MAX_README_LEN = 3000
-    if len(readme_content) > MAX_README_LEN:
-        readme_content = readme_content[:MAX_README_LEN] + "\n... (README truncated)"
-
-    # --- Robust data extraction ---
-    # We use 'or {}' to ensure we have a dictionary, not None
-    # We use .get() to safely access keys that might not exist
-    
-    license_info = repo_data.get('license') or {} 
-    
-    user_prompt = f"""
-    Repository Name: {repo_data.get('name') or 'N/A'}
-    Description: {repo_data.get('description') or 'N/A'}
-    Languages: {json.dumps(lang_data, indent=2)}
-    Stars: {repo_data.get('stargazers_count') or 'N/A'}
-    License: {license_info.get('name') or 'N/A'}
-
-    --- README.md Content ---
-    {readme_content}
-    """
-    return user_prompt
-
-# --- Main tool function for the GitHub/AI analyser ---
-
-def run_github_analyzer(groq_client: Groq, repo_url: str) -> None:
-    """Fetch information from GitHub and send it to the LLM.
-
-    The Groq client must already be constructed by the caller; this module
-    doesn't know about API keys or configuration (see ``cli/main.py`` for an
-    example of creating the client).
-
-    The function prints the streaming response from the model directly to
-    stdout.
-    """
-    
-    # 1. Parse the URL
-    repo_path = parse_repo_url(repo_url)
-    if not repo_path:
-        print(f"{colors.RED}Error: Invalid GitHub URL '{repo_url}'. Please use 'https://github.com/owner/repo'.{colors.END}")
-        return
-
-    # 2. Fetch all data from GitHub
-    data = get_repo_data(repo_path)
-    if not data:
-        return # Error messages are handled inside get_repo_data
-    
-    # 3. Build the prompt for the LLM
-    # This function is now safe from 'None' errors
-    user_prompt = build_user_prompt(data[0], data[1], data[2])
-
-    # 4. Define the chat messages
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    # 5. Get the summary from Groq
-    print(f"{colors.BLUE}Generating summary via Groq... (This will be fast!){colors.END}")
-    
-    print("\n" + "="*30)
-    print(f" {colors.GREEN}AI Analysis of {repo_path}{colors.END} ")
-    print("="*30 + "\n")
-    
-    try:
-        completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b", # Using your preferred model
-            messages=messages,
-            temperature=0.2,
-            max_tokens=1024,
-            stream=True,
-            stop=None
-        )
-        
-        # This is the correct way to stream the output
-        for chunk in completion:
-            print(chunk.choices[0].delta.content or "", end="")
-        
-        print("\n") # Add a newline after the stream is done
-
-    except Exception as e:
-        print(f"{colors.RED}\nAn error occurred during Groq API call: {e}{colors.END}")
+    print(
+        f"{colors.GREEN}Analysis complete – "
+        f"languages: {list(languages.keys())}, "
+        f"frameworks: {frameworks}, "
+        f"cloned to: {local_path}{colors.END}"
+    )
+    return profile
