@@ -43,21 +43,19 @@ def scan(
     console.print(f"[bold blue]Writing files to {output_dir}...[/]")
     generator.write_artifacts(str(output_dir), artifacts)
 
-    # 4. Offer to start docker compose
+    # 4. Run docker compose
     compose_file = output_dir / "docker-compose.dev.yml"
     if compose_file.exists():
         console.print("[bold green]Starting docker compose...[/]")
-        try:
-            subprocess.run(
-                ["docker", "compose", "-f", "docker-compose.dev.yml", "up", "-d", "--build"],
-                cwd=str(output_dir),
-                check=True,
-            )
-        except FileNotFoundError:
-            console.print("[bold red]docker not found on PATH – skipping compose.[/]")
-        except subprocess.CalledProcessError as exc:
-            console.print(f"[bold red]Docker compose failed:[/] {exc}")
-            raise typer.Exit(code=1)
+        compose_result = generator.run_compose(str(output_dir), artifacts)
+        if compose_result["running"]:
+            ports = compose_result["ports"]
+            if ports:
+                console.print(f"[bold green]Containers running on port(s):[/] {ports}")
+            else:
+                console.print("[bold green]Containers are running (no host ports detected).[/]")
+        else:
+            console.print(f"[bold red]Docker compose failed:[/] {compose_result.get('error', 'unknown error')}")
 
     console.print("[bold magenta]Done! Check the output in:[/]", str(output_dir))
 

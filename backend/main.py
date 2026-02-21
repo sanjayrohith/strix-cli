@@ -87,4 +87,13 @@ async def scan(request: Request):
     if local_path:
         generator.write_artifacts(local_path, artifacts)
 
-    return {"profile": profile, "artifacts": artifacts}
+    # Run docker compose up --build -d and capture exposed ports
+    compose_result = {"running": False, "ports": [], "error": "no local_path"}
+    if local_path:
+        compose_result = generator.run_compose(local_path, artifacts)
+
+    return {
+        "profile": profile,
+        "artifacts": artifacts,
+        "compose": compose_result,
+    }
