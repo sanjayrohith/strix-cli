@@ -11,7 +11,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend import analyzer, generator
+import json
+from pathlib import Path
+
+from backend import analyzer, generator, commands
 
 app = FastAPI(title="Strix Ready API", version="0.1.0")
 
@@ -86,6 +89,22 @@ async def scan(request: Request):
     local_path = profile.get("local_path")
     if local_path:
         generator.write_artifacts(local_path, artifacts)
+
+    # Infer useful run/install commands and write them to the repo
+    if local_path:
+        try:
+            cmd_res = commands.infer_commands(profile)
+            script = cmd_res.get("script", "")
+            meta = cmd_res.get("meta", {})
+            # write RUN_COMMANDS.sh and commands.json
+            generator.write_artifacts(local_path, {"RUN_COMMANDS.sh": script, "commands.json": json.dumps(meta, indent=2)})
+            # make the script executable if possible
+            try:
+                Path(local_path, "RUN_COMMANDS.sh").chmod(0o755)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # Run docker compose up --build -d and capture exposed ports
     compose_result = {"running": False, "ports": [], "error": "no local_path"}

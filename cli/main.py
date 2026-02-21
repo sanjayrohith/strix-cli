@@ -3,9 +3,11 @@ import tempfile
 from pathlib import Path
 
 import typer
+import shlex
+import json
 from rich.console import Console
 
-from backend import analyzer, generator, health
+from backend import analyzer, generator, health, commands
 
 app = typer.Typer()
 console = Console()
@@ -15,6 +17,7 @@ console = Console()
 def scan(
     github_url: str,
     os_name: str = typer.Option("linux", "--os", help="Target OS: linux, macos, windows"),
+    auto_install: bool = typer.Option(False, "--auto-install", help="Run the detected install command after writing artifacts"),
 ):
     """Scan a GitHub repository URL, generate config files, and optionally start Docker."""
 
@@ -42,6 +45,40 @@ def scan(
     output_dir = Path(profile.get("local_path", Path.cwd() / "strix-output" / profile.get("name", "repo")))
     console.print(f"[bold blue]Writing files to {output_dir}...[/]")
     generator.write_artifacts(str(output_dir), artifacts)
+
+    # Infer commands and write them to the output directory
+    try:
+        cmd_res = commands.infer_commands(profile)
+        script = cmd_res.get("script", "")
+        meta = cmd_res.get("meta", {})
+        generator.write_artifacts(str(output_dir), {"RUN_COMMANDS.sh": script, "commands.json": json.dumps(meta, indent=2)})
+        try:
+            (output_dir / "RUN_COMMANDS.sh").chmod(0o755)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Optionally run install command (safe opt-in)
+    if auto_install:
+        try:
+            install_cmd = meta.get("install") if isinstance(meta, dict) else None
+            node_modules_present = meta.get("node_modules_present", False) if isinstance(meta, dict) else False
+            if install_cmd:
+                if node_modules_present:
+                    console.print("[bold yellow]node_modules detected — skipping install.[/]")
+                else:
+                    console.print(f"[bold green]Running install command:[/] {install_cmd}")
+                    with console.status("[bold yellow]Installing dependencies...[/]"):
+                        try:
+                            subprocess.run(shlex.split(install_cmd), cwd=str(output_dir), check=True)
+                            console.print("[bold green]Install completed successfully.[/]")
+                        except subprocess.CalledProcessError as e:
+                            console.print(f"[bold red]Install failed:[/] {e}")
+            else:
+                console.print("[bold yellow]No install command detected; skipping auto-install.[/]")
+        except Exception as e:
+            console.print(f"[bold red]Auto-install error:[/] {e}")
 
     # 4. Run docker compose
     compose_file = output_dir / "docker-compose.dev.yml"

@@ -23,12 +23,10 @@ try:
 except FileNotFoundError:
     SYSTEM_PROMPT = (
         "You are an expert DevOps engineer. Given a repository profile, "
-        "generate a production-ready Dockerfile, a docker-compose.dev.yml for "
-        "local development, a .env.example listing required environment variables, "
-        "and a PROJECT.md that explains how to build and run the project.\n\n"
-        "Return your answer as a JSON object with exactly four keys:\n"
-        '  "Dockerfile", "docker-compose.dev.yml", ".env.example", "PROJECT.md"\n'
-        "Each value must be the full file content as a string."
+        "generate production-ready artifacts and an explicit set of install/build/run commands. "
+        "Return your answer as a single JSON object with the following keys: \n"
+        '  "Dockerfile", "docker-compose.dev.yml", ".env.example", "PROJECT.md", "RUN_COMMANDS.sh", "commands.json"\n'
+        "Each value must be the full file content as a string. The RUN_COMMANDS.sh must be a POSIX shell script with idempotent install steps, and commands.json must contain explicit install/build/start/dev/test entries (or null)."
     )
 
 # ---------------------------------------------------------------------------
