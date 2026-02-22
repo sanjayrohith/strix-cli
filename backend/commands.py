@@ -93,6 +93,29 @@ def infer_commands(profile: Dict[str, Any]) -> Dict[str, Any]:
     else:
         meta.update({"type": "unknown"})
 
+    # Detect Docker-related files and suggest docker commands
+    try:
+        dockerfile_present = any(Path(k).name.lower() == "dockerfile" for k in config_files)
+    except Exception:
+        dockerfile_present = False
+    compose_present = any(Path(k).name in ("docker-compose.yml", "docker-compose.yaml") for k in config_files)
+
+    docker_build = None
+    docker_up = None
+    if dockerfile_present:
+        docker_build = "docker build -t app ."
+        docker_up = "docker run --rm -p 8000:8000 app"
+    if compose_present:
+        # Prefer modern `docker compose` CLI but keep simple command suggestion
+        docker_up = "docker compose up --build"
+
+    meta.update({
+        "dockerfile_present": dockerfile_present,
+        "compose_present": compose_present,
+        "docker_build": docker_build,
+        "docker_up": docker_up,
+    })
+
     # Build a shell script
     lines = ["#!/usr/bin/env bash", "set -e"]
     if meta.get("install"):
@@ -109,10 +132,16 @@ def infer_commands(profile: Dict[str, Any]) -> Dict[str, Any]:
         lines.append("\n# Start")
         lines.append(meta["start"])
     else:
-        # If no start found, suggest docker compose if a compose file exists
-        if "docker-compose.yml" in config_files or "docker-compose.yaml" in config_files:
+        # If no start found, prefer docker compose when present, otherwise suggest Dockerfile build/run
+        if meta.get("compose_present"):
             lines.append("\n# Start with docker compose")
-            lines.append("docker compose up --build")
+            lines.append(meta.get("docker_up") or "docker compose up --build")
+        elif meta.get("dockerfile_present"):
+            lines.append("\n# Build and run with Docker")
+            if meta.get("docker_build"):
+                lines.append(meta["docker_build"])
+            if meta.get("docker_up"):
+                lines.append(meta["docker_up"])
 
     script = "\n".join(lines) + "\n"
     return {"script": script, "meta": meta}

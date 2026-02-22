@@ -39,28 +39,167 @@ def _build_user_prompt(profile: Dict[str, Any]) -> str:
     readme = profile.get("readme", "")
     if len(readme) > MAX_README:
         readme = readme[:MAX_README] + "\n... (truncated)"
+    # Short summaries of important config files (package.json, Dockerfile, compose)
+    config_files = profile.get("config_files", {})
+    config_summaries = []
+    for fname, content in config_files.items():
+        snippet = content[:1600] + ("\n... (truncated)" if len(content) > 1600 else "")
+        config_summaries.append((fname, snippet))
 
-    config_summaries = ""
-    for fname, content in profile.get("config_files", {}).items():
-        snippet = content[:2000] if len(content) > 2000 else content
-        config_summaries += f"\n--- {fname} ---\n{snippet}\n"
+    # Heuristic signals for the model
+    has_package = "package.json" in config_files
+    has_py = "requirements.txt" in config_files or "pyproject.toml" in config_files
+    has_dockerfile = any(Path(n).name.lower() == "dockerfile" for n in config_files)
+    has_compose = any(Path(n).name in ("docker-compose.yml", "docker-compose.yaml") for n in config_files)
+    ports = profile.get("ports", [])
 
-    return f"""
-Repository: {profile.get('name', 'N/A')}
-Description: {profile.get('description', 'N/A')}
-Target OS: {profile.get('os', 'linux')}
-Languages: {json.dumps(profile.get('languages', {}), indent=2)}
-Detected frameworks: {profile.get('frameworks', [])}
-Detected ports: {profile.get('ports', [])}
-Local clone path: {profile.get('local_path', 'N/A')}
-Default branch: {profile.get('default_branch', 'main')}
+    # Detect whether this repo is a frontend (vite/react) by scanning package.json scripts / deps
+    is_frontend = False
+    if has_package:
+        try:
+            pj = json.loads(config_files.get("package.json", "{}"))
+            scripts = pj.get("scripts", {})
+            deps = {**pj.get("dependencies", {}), **pj.get("devDependencies", {})}
+            if any(k in deps for k in ("vite", "react", "@vitejs/plugin-react", "next")):
+                is_frontend = True
+        except Exception:
+            is_frontend = False
 
---- README (excerpt) ---
-{readme}
+    # Build a structured user prompt that includes explicit metadata and any existing Dockerfiles
+    cfg_text = "\n".join([f"--- {n} ---\n{c}" for n, c in config_summaries])
 
---- Configuration files found in repo ---
-{config_summaries}
-"""
+    return (
+        f"Repository: {profile.get('name', 'N/A')}\n"
+        f"Description: {profile.get('description', 'N/A')}\n"
+        f"Target OS: {profile.get('os', 'linux')}\n"
+        f"Languages: {json.dumps(profile.get('languages', {}))}\n"
+        f"Detected frameworks: {profile.get('frameworks', [])}\n"
+        f"Detected ports: {ports}\n"
+        f"Is frontend (vite/react): {is_frontend}\n"
+        f"Has package.json: {has_package}\n"
+        f"Has python requirements/pyproject: {has_py}\n"
+        f"Has Dockerfile: {has_dockerfile}\n"
+        f"Has docker-compose: {has_compose}\n"
+        f"Local clone path: {profile.get('local_path', 'N/A')}\n"
+        f"Default branch: {profile.get('default_branch', 'main')}\n\n"
+        f"--- README (excerpt) ---\n{readme}\n\n"
+        f"--- Config files (snippets) ---\n{cfg_text}\n\n"
+        "Guidance for the AI:\n"
+        "- Prefer multi-stage Dockerfiles. For a frontend build (Vite/React), produce a builder stage that runs `npm ci` and `npm run build` and a runtime stage that serves the build output with `nginx:alpine`.\n"
+        "- CRITICAL: For nginx-based frontends, ALWAYS expose port 80 (standard HTTP), NOT the dev server port (5173 for Vite, 3000 for React). The detected port is ONLY for development mode.\n"
+        "- CRITICAL: When using nginx, ensure the Dockerfile includes: COPY nginx.conf /etc/nginx/conf.d/default.conf\n"
+        "- CRITICAL: Do NOT use USER directive in nginx Dockerfiles. nginx must run as root (it drops privileges automatically).\n"
+        "- For application containers (Node.js backends, Python apps), create a non-root runtime user.\n"
+        "- Do NOT copy full `node_modules` from the build stage into the runtime. If using a Node runtime, install only production deps in runtime or use `npm ci --omit=dev`.\n"
+        "- For backend (FastAPI) prefer a Python multi-stage build with a venv and run with Gunicorn+Uvicorn workers in production.\n"
+        "- Include a comprehensive `.dockerignore` file and `nginx.conf` when serving static assets.\n"
+        "- Provide both `docker-compose.dev.yml` (mount source, use hot-reload command with --host 0.0.0.0 for Vite, preserve container node_modules) and `docker-compose.yml` (production using built image).\n"
+        "- Add `HEALTHCHECK` entries using wget (not curl, as Alpine doesn't include curl by default).\n"
+        "- For nginx.conf, include SPA routing support: try_files $uri $uri/ /index.html;\n"
+        "- If an existing Dockerfile or compose file is present, produce an improved version and a short `PROJECT.md` section called `AI_CHANGES` that lists exactly what you changed and why.\n"
+        "- Return ONLY a single JSON object with keys: `Dockerfile`, `docker-compose.dev.yml`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `nginx.conf` (if applicable), `PROJECT.md`, `RUN_COMMANDS.sh`, and `commands.json`. Each value must be the complete file content as a string.\n"
+    )
+
+
+def _validate_and_fix_artifacts(artifacts: Dict[str, str], profile: Dict[str, Any]) -> Dict[str, str]:
+    """Validate and auto-fix common AI mistakes in generated artifacts."""
+    
+    # Fix 1: Ensure nginx.conf is copied in Dockerfile
+    if "nginx.conf" in artifacts and "Dockerfile" in artifacts:
+        dockerfile = artifacts["Dockerfile"]
+        if "nginx:alpine" in dockerfile and "COPY nginx.conf" not in dockerfile:
+            # Insert COPY instruction after FROM nginx:alpine
+            lines = dockerfile.split("\n")
+            new_lines = []
+            for line in lines:
+                new_lines.append(line)
+                if "FROM nginx:alpine" in line:
+                    new_lines.append("COPY nginx.conf /etc/nginx/conf.d/default.conf")
+            artifacts["Dockerfile"] = "\n".join(new_lines)
+            print(f"{colors.YELLOW}  [AUTO-FIX] Added COPY nginx.conf to Dockerfile{colors.END}")
+    
+    # Fix 2: Remove USER directive from nginx containers
+    if "Dockerfile" in artifacts:
+        dockerfile = artifacts["Dockerfile"]
+        if "nginx:alpine" in dockerfile and "USER " in dockerfile:
+            lines = dockerfile.split("\n")
+            filtered_lines = []
+            for line in lines:
+                if not line.strip().startswith("USER ") or "USER root" in line:
+                    filtered_lines.append(line)
+                else:
+                    print(f"{colors.YELLOW}  [AUTO-FIX] Removed '{line.strip()}' from nginx Dockerfile{colors.END}")
+            artifacts["Dockerfile"] = "\n".join(filtered_lines)
+    
+    # Fix 3: Ensure Vite dev command has --host 0.0.0.0
+    if "docker-compose.dev.yml" in artifacts:
+        compose = artifacts["docker-compose.dev.yml"]
+        frameworks = profile.get("frameworks", [])
+        if "Vite" in frameworks or "React" in frameworks:
+            if "npm run dev" in compose and "--host 0.0.0.0" not in compose:
+                compose = compose.replace("npm run dev", "npm run dev -- --host 0.0.0.0")
+                artifacts["docker-compose.dev.yml"] = compose
+                print(f"{colors.YELLOW}  [AUTO-FIX] Added --host 0.0.0.0 to Vite dev command{colors.END}")
+    
+    # Fix 4: Replace curl with wget in healthchecks (Alpine doesn't have curl)
+    if "Dockerfile" in artifacts:
+        dockerfile = artifacts["Dockerfile"]
+        if "curl --fail" in dockerfile or "curl -f" in dockerfile:
+            dockerfile = dockerfile.replace("curl --fail", "wget --no-verbose --tries=1 --spider")
+            dockerfile = dockerfile.replace("curl -f", "wget --no-verbose --tries=1 --spider")
+            artifacts["Dockerfile"] = dockerfile
+            print(f"{colors.YELLOW}  [AUTO-FIX] Replaced curl with wget in healthcheck{colors.END}")
+    
+    # Fix 5: Ensure nginx listens on port 80, not dev port
+    if "nginx.conf" in artifacts:
+        nginx_conf = artifacts["nginx.conf"]
+        # Check for wrong ports (5173 for Vite, 3000 for React/Next)
+        if "listen 5173" in nginx_conf or "listen 3000" in nginx_conf:
+            nginx_conf = re.sub(r"listen \d+;", "listen 80;", nginx_conf)
+            artifacts["nginx.conf"] = nginx_conf
+            print(f"{colors.YELLOW}  [AUTO-FIX] Changed nginx listen port to 80{colors.END}")
+    
+    # Fix 6: Ensure Dockerfile exposes port 80 for nginx, not dev port
+    if "Dockerfile" in artifacts:
+        dockerfile = artifacts["Dockerfile"]
+        if "nginx:alpine" in dockerfile:
+            if "EXPOSE 5173" in dockerfile or "EXPOSE 3000" in dockerfile:
+                dockerfile = re.sub(r"EXPOSE \d+", "EXPOSE 80", dockerfile)
+                artifacts["Dockerfile"] = dockerfile
+                print(f"{colors.YELLOW}  [AUTO-FIX] Changed EXPOSE port to 80 in nginx Dockerfile{colors.END}")
+    
+    # Fix 7: Add SPA routing to nginx.conf if missing
+    if "nginx.conf" in artifacts:
+        nginx_conf = artifacts["nginx.conf"]
+        if "try_files" not in nginx_conf and "location /" in nginx_conf:
+            # Insert try_files after location /
+            nginx_conf = nginx_conf.replace(
+                "location / {",
+                "location / {\n        try_files $uri $uri/ /index.html;"
+            )
+            artifacts["nginx.conf"] = nginx_conf
+            print(f"{colors.YELLOW}  [AUTO-FIX] Added SPA routing (try_files) to nginx.conf{colors.END}")
+        
+        # Ensure root and index directives are present
+        if "root /usr/share/nginx/html" not in nginx_conf:
+            # Add root and index after server_name
+            nginx_conf = nginx_conf.replace(
+                "server_name localhost;",
+                "server_name localhost;\n    \n    root /usr/share/nginx/html;\n    index index.html;"
+            )
+            artifacts["nginx.conf"] = nginx_conf
+            print(f"{colors.YELLOW}  [AUTO-FIX] Added root and index directives to nginx.conf{colors.END}")
+    
+    # Fix 8: Ensure compose files use version 3.8
+    for compose_file in ["docker-compose.dev.yml", "docker-compose.yml"]:
+        if compose_file in artifacts:
+            compose = artifacts[compose_file]
+            if "version:" in compose and "version: '3.8'" not in compose:
+                compose = re.sub(r"version:\s*['\"]?\d+(\.\d+)?['\"]?", "version: '3.8'", compose)
+                artifacts[compose_file] = compose
+                print(f"{colors.YELLOW}  [AUTO-FIX] Updated {compose_file} to version 3.8{colors.END}")
+    
+    return artifacts
 
 
 def generate(profile: Dict[str, Any]) -> Dict[str, str]:
@@ -102,6 +241,9 @@ def generate(profile: Dict[str, Any]) -> Dict[str, str]:
         try:
             artifacts = json.loads(cleaned)
             if isinstance(artifacts, dict) and "Dockerfile" in artifacts:
+                # Validate and auto-fix common mistakes
+                print(f"{colors.CYAN}Validating and fixing generated artifacts...{colors.END}")
+                artifacts = _validate_and_fix_artifacts(artifacts, profile)
                 return artifacts
         except json.JSONDecodeError:
             pass
