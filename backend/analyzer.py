@@ -3,9 +3,12 @@ import subprocess
 import json
 import tempfile
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 
 from backend.utils import colors
+
+# Type alias for the optional log callback
+LogCallback = Optional[Callable[[str, str, Optional[dict]], None]]
 
 
 # --- Configuration ---
@@ -50,7 +53,7 @@ def _build_clone_url(repo_url: str) -> str:
 # Clone
 # ---------------------------------------------------------------------------
 
-def clone_repo(repo_url: str, target_dir: Optional[str] = None) -> Path:
+def clone_repo(repo_url: str, target_dir: Optional[str] = None, on_log: LogCallback = None) -> Path:
     """Clone ``repo_url`` into ``target_dir`` (or a temp directory).
 
     Returns the absolute Path to the cloned repo on disk.
@@ -65,10 +68,17 @@ def clone_repo(repo_url: str, target_dir: Optional[str] = None) -> Path:
         dest = Path(tempfile.mkdtemp(prefix="strix_")) / repo_name
 
     if dest.exists():
-        print(f"{colors.YELLOW}Directory {dest} already exists – reusing.{colors.END}")
+        msg = f"Directory {dest} already exists – reusing."
+        print(f"{colors.YELLOW}{msg}{colors.END}")
+        if on_log:
+            on_log("clone", msg)
         return dest.resolve()
 
-    print(f"{colors.BLUE}Cloning {clone_url} → {dest}{colors.END}")
+    msg = f"Cloning {clone_url} → {dest}"
+    print(f"{colors.BLUE}{msg}{colors.END}")
+    if on_log:
+        on_log("clone", msg)
+
     env = os.environ.copy()
     if GITHUB_TOKEN:
         env["GIT_ASKPASS"] = "echo"
@@ -83,7 +93,10 @@ def clone_repo(repo_url: str, target_dir: Optional[str] = None) -> Path:
         text=True,
         env=env,
     )
-    print(f"{colors.GREEN}Cloned successfully.{colors.END}")
+    msg = "Cloned successfully."
+    print(f"{colors.GREEN}{msg}{colors.END}")
+    if on_log:
+        on_log("clone", msg)
     return dest.resolve()
 
 
@@ -99,9 +112,6 @@ _CONFIG_FILES = [
     "requirements.txt",
     "pyproject.toml",
     "Pipfile",
-    "Dockerfile",
-    "docker-compose.yml",
-    "docker-compose.yaml",
     "Makefile",
     "Gemfile",
     "go.mod",
@@ -109,6 +119,11 @@ _CONFIG_FILES = [
     "build.gradle",
     ".env",
     ".env.example",
+    "tsconfig.json",
+    "vite.config.ts",
+    "vite.config.js",
+    "next.config.js",
+    "next.config.mjs",
 ]
 
 
@@ -190,7 +205,7 @@ def _detect_frameworks(config_files: Dict[str, str]) -> tuple[List[str], List[in
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def analyze_repo(repo_url: str, user_os: str = "linux") -> Dict[str, Any]:
+def analyze_repo(repo_url: str, user_os: str = "linux", on_log: LogCallback = None) -> Dict[str, Any]:
     """Clone a GitHub repository locally and return a structured profile.
 
     Parameters
@@ -199,6 +214,8 @@ def analyze_repo(repo_url: str, user_os: str = "linux") -> Dict[str, Any]:
         Full GitHub URL (e.g. ``https://github.com/owner/repo``).
     user_os : str
         The operating system the user is running (``linux``, ``macos``, ``windows``).
+    on_log : callable, optional
+        Callback ``(step, message, data)`` for live status streaming.
 
     Returns
     -------
@@ -213,9 +230,11 @@ def analyze_repo(repo_url: str, user_os: str = "linux") -> Dict[str, Any]:
         )
 
     # 1. Clone
-    local_path = clone_repo(repo_url)
+    local_path = clone_repo(repo_url, on_log=on_log)
 
     # 2. Read config files from disk
+    if on_log:
+        on_log("analyze", "Reading config files...")
     config_files: Dict[str, str] = {}
     for fname in _CONFIG_FILES:
         content = _read_if_exists(local_path, fname)
@@ -249,10 +268,17 @@ def analyze_repo(repo_url: str, user_os: str = "linux") -> Dict[str, Any]:
         "readme": readme,
     }
 
-    print(
-        f"{colors.GREEN}Analysis complete – "
+    msg = (
+        f"Analysis complete – "
         f"languages: {list(languages.keys())}, "
         f"frameworks: {frameworks}, "
-        f"cloned to: {local_path}{colors.END}"
+        f"cloned to: {local_path}"
     )
+    print(f"{colors.GREEN}{msg}{colors.END}")
+    if on_log:
+        on_log("analyze", msg, {
+            "languages": list(languages.keys()),
+            "frameworks": frameworks,
+            "ports": ports,
+        })
     return profile

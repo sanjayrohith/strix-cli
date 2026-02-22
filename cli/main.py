@@ -1,13 +1,21 @@
+"""
+CLI entry-point for Strix.
+
+Commands:
+  strix scan <github_url>       – Clone, analyse, install deps, run dev server
+  strix gui                     – Start the backend API for the React frontend
+  strix doctor                  – Health-check running services
+"""
+
 import subprocess
-import tempfile
+import signal
+import sys
 from pathlib import Path
 
 import typer
-import shlex
-import json
 from rich.console import Console
 
-from backend import analyzer, generator, health, commands
+from backend import analyzer, generator, health
 
 app = typer.Typer()
 console = Console()
@@ -17,9 +25,8 @@ console = Console()
 def scan(
     github_url: str,
     os_name: str = typer.Option("linux", "--os", help="Target OS: linux, macos, windows"),
-    auto_install: bool = typer.Option(False, "--auto-install", help="Run the detected install command after writing artifacts"),
 ):
-    """Scan a GitHub repository URL, generate config files, and optionally start Docker."""
+    """Scan a GitHub repo, detect stack, and run the local dev server."""
 
     console.print("[bold green]Starting analysis of repository:[/]", github_url)
 
@@ -36,65 +43,52 @@ def scan(
         f"[bold cyan]Frameworks:[/] {profile.get('frameworks', [])}"
     )
 
-    # 2. Generate artifacts via AI
-    console.print("[bold green]Generating artifacts via AI...[/]")
+    # 2. Get commands from AI
+    console.print("[bold green]Getting setup commands from AI...[/]")
     with console.status("[bold yellow]Contacting Groq..."):
-        artifacts = generator.generate(profile)
+        commands = generator.generate(profile)
 
-    # 3. Write artifacts into the cloned repo directory
-    output_dir = Path(profile.get("local_path", Path.cwd() / "strix-output" / profile.get("name", "repo")))
-    console.print(f"[bold blue]Writing files to {output_dir}...[/]")
-    generator.write_artifacts(str(output_dir), artifacts)
+    local_path = profile.get("local_path", ".")
 
-    # Infer commands and write them to the output directory
-    try:
-        cmd_res = commands.infer_commands(profile)
-        script = cmd_res.get("script", "")
-        meta = cmd_res.get("meta", {})
-        generator.write_artifacts(str(output_dir), {"RUN_COMMANDS.sh": script, "commands.json": json.dumps(meta, indent=2)})
+    # 3. Show what we're about to do
+    console.print("\n[bold blue]═══ Setup Plan ═══[/]")
+    if commands.get("pre_install"):
+        console.print(f"  [yellow]Pre-install:[/] {commands['pre_install']}")
+    console.print(f"  [yellow]Install:[/]     {commands.get('install_command', 'N/A')}")
+    if commands.get("post_install"):
+        console.print(f"  [yellow]Post-install:[/] {commands['post_install']}")
+    console.print(f"  [yellow]Dev server:[/]  {commands.get('dev_command', 'N/A')}")
+    console.print(f"  [yellow]Port:[/]        {commands.get('port', 'unknown')}")
+    if commands.get("env_notes"):
+        console.print(f"  [yellow]Notes:[/]       {commands['env_notes']}")
+    console.print()
+
+    # 4. Execute locally
+    console.print("[bold green]Running setup...[/]")
+    result = generator.run_local(local_path, commands)
+
+    if result.get("running"):
+        port = result.get("port", "unknown")
+        console.print(f"\n[bold green]✓ Dev server is running at:[/] http://localhost:{port}")
+        console.print(f"[bold blue]  Project dir:[/] {local_path}")
+        console.print(f"[bold blue]  PID:[/] {result.get('pid', 'N/A')}")
+        console.print("[bold yellow]  Press Ctrl+C to stop.[/]\n")
+
+        # Keep the CLI alive until user kills it
         try:
-            (output_dir / "RUN_COMMANDS.sh").chmod(0o755)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    # Optionally run install command (safe opt-in)
-    if auto_install:
-        try:
-            install_cmd = meta.get("install") if isinstance(meta, dict) else None
-            node_modules_present = meta.get("node_modules_present", False) if isinstance(meta, dict) else False
-            if install_cmd:
-                if node_modules_present:
-                    console.print("[bold yellow]node_modules detected — skipping install.[/]")
-                else:
-                    console.print(f"[bold green]Running install command:[/] {install_cmd}")
-                    with console.status("[bold yellow]Installing dependencies...[/]"):
-                        try:
-                            subprocess.run(shlex.split(install_cmd), cwd=str(output_dir), check=True)
-                            console.print("[bold green]Install completed successfully.[/]")
-                        except subprocess.CalledProcessError as e:
-                            console.print(f"[bold red]Install failed:[/] {e}")
-            else:
-                console.print("[bold yellow]No install command detected; skipping auto-install.[/]")
-        except Exception as e:
-            console.print(f"[bold red]Auto-install error:[/] {e}")
-
-    # 4. Run docker compose
-    compose_file = output_dir / "docker-compose.dev.yml"
-    if compose_file.exists():
-        console.print("[bold green]Starting docker compose...[/]")
-        compose_result = generator.run_compose(str(output_dir), artifacts)
-        if compose_result["running"]:
-            ports = compose_result["ports"]
-            if ports:
-                console.print(f"[bold green]Containers running on port(s):[/] {ports}")
-            else:
-                console.print("[bold green]Containers are running (no host ports detected).[/]")
-        else:
-            console.print(f"[bold red]Docker compose failed:[/] {compose_result.get('error', 'unknown error')}")
-
-    console.print("[bold magenta]Done! Check the output in:[/]", str(output_dir))
+            signal.pause()
+        except (KeyboardInterrupt, AttributeError):
+            # AttributeError: signal.pause() not available on Windows
+            try:
+                while True:
+                    pass
+            except KeyboardInterrupt:
+                pass
+        console.print("\n[bold yellow]Stopped.[/]")
+    else:
+        console.print(f"\n[bold red]✗ Failed:[/] {result.get('error', 'unknown error')}")
+        console.print(f"[bold blue]  Project dir:[/] {local_path}")
+        raise typer.Exit(code=1)
 
 
 @app.command()
