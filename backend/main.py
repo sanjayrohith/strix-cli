@@ -46,8 +46,8 @@ def health():
 
 @app.post("/scan")
 async def scan(request: Request):
-    """Clone a GitHub repo, analyse it, get setup commands from AI, and
-    execute them locally.
+    """Clone a GitHub repo, analyse it, and generate Docker configuration
+    files via AI.
 
     **Request body (JSON):**
     ```json
@@ -58,19 +58,15 @@ async def scan(request: Request):
     ```json
     {
       "profile": { ... },
-      "commands": {
-        "install_command": "npm install",
-        "dev_command": "npm run dev",
-        "port": 5173,
-        "env_vars": {},
-        "env_notes": "..."
+      "artifacts": {
+        "Dockerfile": "...",
+        "docker-compose.yml": "...",
+        ".dockerignore": "...",
+        ".env.example": "...",
+        "notes": "..."
       },
-      "result": {
-        "running": true,
-        "port": 5173,
-        "pid": 12345,
-        "error": null
-      }
+      "written_files": ["/tmp/strix_.../Dockerfile", ...],
+      "local_path": "/tmp/strix_.../repo"
     }
     ```
     """
@@ -89,12 +85,12 @@ async def scan(request: Request):
     except Exception as exc:
         return JSONResponse({"detail": f"Clone/analysis failed: {exc}"}, status_code=500)
 
-    # 2. Get commands from AI
-    commands = generator.generate(profile)
+    # 2. Generate Docker artifacts from AI
+    artifacts = generator.generate_docker(profile)
 
-    # 3. Execute locally
+    # 3. Write artifacts to the cloned repo
     local_path = profile.get("local_path", ".")
-    result = generator.run_local(local_path, commands)
+    written_files = generator.write_artifacts(local_path, artifacts)
 
     return {
         "profile": {
@@ -104,8 +100,9 @@ async def scan(request: Request):
             "ports": profile.get("ports"),
             "local_path": profile.get("local_path"),
         },
-        "commands": commands,
-        "result": result,
+        "artifacts": artifacts,
+        "written_files": written_files,
+        "local_path": local_path,
     }
 
 

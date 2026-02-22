@@ -28,7 +28,7 @@ LogCallback = Optional[Callable[[str, str, Optional[dict]], None]]
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 # ---------------------------------------------------------------------------
-# Load system prompt
+# Load system prompts
 # ---------------------------------------------------------------------------
 _PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "generate_artifacts_prompt.txt"
 try:
@@ -38,6 +38,16 @@ except FileNotFoundError:
         "You are an expert developer assistant. Given a repository profile, "
         "return a JSON object with keys: install_command, dev_command, port, "
         "env_vars, env_notes, pre_install, post_install."
+    )
+
+_DOCKER_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "generate_docker_prompt.txt"
+try:
+    DOCKER_SYSTEM_PROMPT = _DOCKER_PROMPT_PATH.read_text()
+except FileNotFoundError:
+    DOCKER_SYSTEM_PROMPT = (
+        "You are an expert DevOps engineer. Given a repository profile, "
+        "return a JSON object with keys: Dockerfile, docker-compose.yml, "
+        ".dockerignore, .env.example, notes. Each value is the full file content."
     )
 
 
@@ -225,6 +235,173 @@ def generate(profile: Dict[str, Any], on_log: LogCallback = None) -> Dict[str, A
         if on_log:
             on_log("ai", msg)
         return _fallback_commands(profile)
+
+
+# ---------------------------------------------------------------------------
+# Docker artifact generation (Generate button)
+# ---------------------------------------------------------------------------
+
+def generate_docker(profile: Dict[str, Any], on_log: LogCallback = None) -> Dict[str, str]:
+    """Send the repo profile to AI and get Docker config files back.
+
+    Returns a dict with keys: Dockerfile, docker-compose.yml, .dockerignore,
+    .env.example, notes.
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        msg = "GROQ_API_KEY not set"
+        if on_log:
+            on_log("ai", msg)
+        return _fallback_docker(profile)
+
+    client = Groq(api_key=api_key)
+    user_prompt = _build_user_prompt(profile)
+
+    if on_log:
+        on_log("ai", "Contacting AI for Docker configuration...")
+
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": DOCKER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=2048,
+        )
+        raw = completion.choices[0].message.content or ""
+        result = _parse_ai_response(raw)
+
+        if result and "Dockerfile" in result:
+            msg = "AI returned Docker config successfully."
+            print(f"{colors.GREEN}{msg}{colors.END}")
+            if on_log:
+                on_log("ai", msg, result)
+            return result
+
+        msg = "AI response missing Dockerfile – using fallback."
+        print(f"{colors.YELLOW}{msg}{colors.END}")
+        if on_log:
+            on_log("ai", msg)
+        return _fallback_docker(profile)
+
+    except Exception as e:
+        msg = f"Groq API error: {e}"
+        print(f"{colors.RED}{msg}{colors.END}")
+        if on_log:
+            on_log("ai", msg)
+        return _fallback_docker(profile)
+
+
+def _fallback_docker(profile: Dict[str, Any]) -> Dict[str, str]:
+    """Minimal Docker files when AI is unavailable."""
+    langs = profile.get("languages", [])
+    name = profile.get("name", "app")
+
+    if "JavaScript" in langs or "TypeScript" in langs:
+        dockerfile = (
+            "FROM node:20-alpine\n"
+            "WORKDIR /app\n"
+            "COPY package*.json ./\n"
+            "RUN npm install\n"
+            "COPY . .\n"
+            "EXPOSE 3000\n"
+            'CMD ["npm", "run", "dev"]\n'
+        )
+        compose = (
+            "services:\n"
+            f"  {name}:\n"
+            "    build: .\n"
+            "    ports:\n"
+            '      - "3000:3000"\n'
+            "    volumes:\n"
+            "      - .:/app\n"
+            "      - /app/node_modules\n"
+            "    env_file: [.env]\n"
+        )
+    elif "Python" in langs:
+        dockerfile = (
+            "FROM python:3.12-slim\n"
+            "WORKDIR /app\n"
+            "COPY requirements.txt ./\n"
+            "RUN pip install --no-cache-dir -r requirements.txt\n"
+            "COPY . .\n"
+            "EXPOSE 8000\n"
+            'CMD ["python", "main.py"]\n'
+        )
+        compose = (
+            "services:\n"
+            f"  {name}:\n"
+            "    build: .\n"
+            "    ports:\n"
+            '      - "8000:8000"\n'
+            "    volumes:\n"
+            "      - .:/app\n"
+            "    env_file: [.env]\n"
+        )
+    else:
+        dockerfile = (
+            "FROM ubuntu:22.04\n"
+            "WORKDIR /app\n"
+            "COPY . .\n"
+            "EXPOSE 8080\n"
+            'CMD ["bash"]\n'
+        )
+        compose = (
+            "services:\n"
+            f"  {name}:\n"
+            "    build: .\n"
+            "    ports:\n"
+            '      - "8080:8080"\n'
+            "    volumes:\n"
+            "      - .:/app\n"
+        )
+
+    return {
+        "Dockerfile": dockerfile,
+        "docker-compose.yml": compose,
+        ".dockerignore": "node_modules\n.git\n.env\n.env.local\ndist\n__pycache__\n.venv\n*.log\n.DS_Store\n",
+        ".env.example": "# Add your environment variables here\n",
+        "notes": "Fallback Docker config generated (AI unavailable).",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Write generated Docker artifacts to disk
+# ---------------------------------------------------------------------------
+
+def write_artifacts(target_dir: str, artifacts: Dict[str, str], on_log: LogCallback = None) -> list:
+    """Write Docker config files into the project directory.
+
+    Returns a list of file paths that were written.
+    """
+    cwd = Path(target_dir)
+    written = []
+
+    file_keys = ["Dockerfile", "docker-compose.yml", ".dockerignore", ".env.example"]
+
+    for key in file_keys:
+        content = artifacts.get(key)
+        if not content:
+            continue
+
+        file_path = cwd / key
+        # Don't overwrite existing files without notice
+        if file_path.exists():
+            msg = f"  {key} already exists – overwriting."
+            print(f"{colors.YELLOW}{msg}{colors.END}")
+            if on_log:
+                on_log("write", msg)
+
+        file_path.write_text(content)
+        msg = f"  wrote {file_path}"
+        print(f"{colors.GREEN}{msg}{colors.END}")
+        if on_log:
+            on_log("write", msg)
+        written.append(str(file_path))
+
+    return written
 
 
 # ---------------------------------------------------------------------------
